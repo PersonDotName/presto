@@ -254,7 +254,7 @@ public class PagesIndex
         estimatedSize = calculateEstimatedSize();
     }
 
-    private long calculateEstimatedSize()
+    public long calculateEstimatedSize()
     {
         long elementsSize = (channels.length > 0) ? sizeOf(channels[0].elements()) : 0;
         long channelsArraySize = elementsSize * channels.length;

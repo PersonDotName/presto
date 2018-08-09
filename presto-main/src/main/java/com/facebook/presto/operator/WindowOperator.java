@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.operator;
 
+import com.facebook.presto.memory.context.AggregatedMemoryContext;
 import com.facebook.presto.memory.context.LocalMemoryContext;
 import com.facebook.presto.operator.window.FramedWindowFunction;
 import com.facebook.presto.operator.window.WindowPartition;
@@ -28,6 +29,7 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.primitives.Ints;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.OptionalInt;
@@ -35,6 +37,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiPredicate;
 import java.util.stream.Stream;
 
+import static com.facebook.presto.operator.WorkProcessor.ProcessorState.finished;
+import static com.facebook.presto.operator.WorkProcessor.ProcessorState.needsMoreData;
 import static com.facebook.presto.spi.block.SortOrder.ASC_NULLS_LAST;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkPositionIndex;
@@ -173,6 +177,10 @@ public class WindowOperator
     private final PagesHashStrategy preSortedPartitionHashStrategy;
     private final PagesHashStrategy peerGroupHashStrategy;
 
+    private final List<Type> sourceTypes;
+    private final int expectedPositions;
+    private final PagesIndex.Factory pagesIndexFactory;
+
     private final PagesIndex pagesIndex;
 
     private final PageBuilder pageBuilder;
@@ -226,6 +234,9 @@ public class WindowOperator
                         .map(WindowFunctionDefinition::getType))
                 .collect(toImmutableList());
 
+        this.sourceTypes = sourceTypes;
+        this.expectedPositions = expectedPositions;
+        this.pagesIndexFactory = pagesIndexFactory;
         this.pagesIndex = pagesIndexFactory.newPagesIndex(sourceTypes, expectedPositions);
         this.preGroupedChannels = Ints.toArray(preGroupedChannels);
         this.preGroupedPartitionHashStrategy = pagesIndex.createPagesHashStrategy(preGroupedChannels, OptionalInt.empty());
@@ -245,8 +256,7 @@ public class WindowOperator
             // This already implies that set(preGroupedChannels) == set(partitionChannels) (enforced with checkArgument)
             this.orderChannels = ImmutableList.copyOf(Iterables.skip(sortChannels, preSortedChannelPrefix));
             this.ordering = ImmutableList.copyOf(Iterables.skip(sortOrder, preSortedChannelPrefix));
-        }
-        else {
+        } else {
             // Otherwise, we need to sort by the unGroupedPartitionChannels and all original sort channels
             this.orderChannels = ImmutableList.copyOf(concat(unGroupedPartitionChannels, sortChannels));
             this.ordering = ImmutableList.copyOf(concat(nCopies(unGroupedPartitionChannels.size(), ASC_NULLS_LAST), sortOrder));
@@ -322,8 +332,7 @@ public class WindowOperator
         if (pendingInput != null || state == State.FINISHING) {
             finishPagesIndex();
             return true;
-        }
-        else {
+        } else {
             return false;
         }
     }
@@ -348,13 +357,11 @@ public class WindowOperator
             if (page.getPositionCount() - groupEnd > 0) {
                 // Save the remaining page, which may contain multiple partitions
                 return page.getRegion(groupEnd, page.getPositionCount() - groupEnd);
-            }
-            else {
+            } else {
                 // Page fully consumed
                 return null;
             }
-        }
-        else {
+        } else {
             // We had previous results buffered, but the new page starts with new group values
             return page;
         }
@@ -367,6 +374,33 @@ public class WindowOperator
             newBlocks[i] = page.getBlock(channels[i]);
         }
         return new Page(page.getPositionCount(), newBlocks);
+    }
+
+    // Extract all partitions from current pagesIndex
+    // This method does not try to extract partitions from current
+    // pending input
+    private WorkProcessor<WindowPartition> producePartitions(WorkProcessor<PagesIndex> pagesIndex)
+    {
+        return pagesIndex.flatMap(currentPagesIndex -> {
+
+            return WorkProcessor.create(new WorkProcessor.Process<WindowPartition>()
+            {
+                int partitionStart = 0;
+
+                @Override
+                public WorkProcessor.ProcessorState<WindowPartition> process()
+                {
+                    WindowPartition currentPartition = null;
+                    while (partitionStart < currentPagesIndex.getPositionCount()) {
+                        int partitionEnd = findGroupEnd(currentPagesIndex, unGroupedPartitionHashStrategy, partitionStart);
+                        currentPartition = new WindowPartition(currentPagesIndex, partitionStart, partitionEnd, outputChannels, windowFunctions, peerGroupHashStrategy);
+                        windowInfo.addPartition(currentPartition);
+                    }
+
+                    return WorkProcessor.ProcessorState.ofResult(currentPartition);
+                }
+            });
+        });
     }
 
     @Override
@@ -398,8 +432,7 @@ public class WindowOperator
                     // Try to extract more partitions from the pendingInput
                     if (pendingInput != null && processPendingInput()) {
                         partitionStart = 0;
-                    }
-                    else if (state == State.FINISHING) {
+                    } else if (state == State.FINISHING) {
                         state = State.FINISHED;
                         // Output the remaining page if we have anything buffered
                         if (!pageBuilder.isEmpty()) {
@@ -408,8 +441,7 @@ public class WindowOperator
                             return page;
                         }
                         return null;
-                    }
-                    else {
+                    } else {
                         state = State.NEEDS_INPUT;
                         return null;
                     }
@@ -428,22 +460,24 @@ public class WindowOperator
         return page;
     }
 
-    private void sortPagesIndexIfNecessary()
+    private void sortPagesIndexIfNecessary(PagesIndex currentPagesIndex)
     {
-        if (pagesIndex.getPositionCount() > 1 && !orderChannels.isEmpty()) {
+        if (currentPagesIndex.getPositionCount() > 1 && !orderChannels.isEmpty()) {
             int startPosition = 0;
-            while (startPosition < pagesIndex.getPositionCount()) {
-                int endPosition = findGroupEnd(pagesIndex, preSortedPartitionHashStrategy, startPosition);
-                pagesIndex.sort(orderChannels, ordering, startPosition, endPosition);
+            while (startPosition < currentPagesIndex.getPositionCount()) {
+                int endPosition = findGroupEnd(currentPagesIndex, preSortedPartitionHashStrategy, startPosition);
+                currentPagesIndex.sort(orderChannels, ordering, startPosition, endPosition);
                 startPosition = endPosition;
             }
         }
     }
 
-    private void finishPagesIndex()
+    private PagesIndex finishPagesIndex()
     {
-        sortPagesIndexIfNecessary();
+        sortPagesIndexIfNecessary(pagesIndex);
         windowInfo.addIndex(pagesIndex);
+
+        return pagesIndex;
     }
 
     // Assumes input grouped on relevant pagesHashStrategy columns
@@ -466,8 +500,8 @@ public class WindowOperator
 
     /**
      * @param startPosition - inclusive
-     * @param endPosition - exclusive
-     * @param comparator - returns true if positions given as parameters are equal
+     * @param endPosition   - exclusive
+     * @param comparator    - returns true if positions given as parameters are equal
      * @return the end of the group position exclusive (the position the very next group starts)
      */
     @VisibleForTesting
@@ -497,8 +531,7 @@ public class WindowOperator
             if (comparator.test(left, mid)) {
                 // explore to the right
                 left = mid;
-            }
-            else {
+            } else {
                 // explore to the left
                 right = mid;
             }
@@ -510,8 +543,7 @@ public class WindowOperator
             for (int second = first + 1; second < endPosition; second++) {
                 if (!comparator.test(first, second)) {
                     previousPairsWereEqual = false;
-                }
-                else if (!previousPairsWereEqual) {
+                } else if (!previousPairsWereEqual) {
                     throw new IllegalArgumentException("The input is not sorted");
                 }
             }
@@ -525,5 +557,165 @@ public class WindowOperator
     public void close()
     {
         driverWindowInfo.set(Optional.of(windowInfo.build()));
+    }
+
+    private class ProducePagesIndex
+            implements WorkProcessor.Transformation<Page, WorkProcessor<PagesIndex>>
+    {
+        private final LocalMemoryContext memoryContext;
+        private Page pendingInput;
+        private PagesIndex innerPagesIndex;
+
+        private ProducePagesIndex(AggregatedMemoryContext memoryContext)
+        {
+            this.memoryContext = memoryContext.newLocalMemoryContext(ProducePagesIndex.class.getSimpleName());
+        }
+
+        @Override
+        public WorkProcessor.ProcessorState<WorkProcessor<PagesIndex>> process(Optional<Page> pageOptional)
+        {
+            boolean finishing = !pageOptional.isPresent();
+            if (finishing && pendingInput == null) {
+                memoryContext.close();
+                return finished();
+            }
+
+            if (pendingInput == null) {
+                Page page = pageOptional.get();
+                if (page.getPositionCount() == 0) {
+                    return needsMoreData();
+                }
+                pendingInput = page;
+            }
+
+            pendingInput = updatePagesIndex(pendingInput);
+
+            // If we have unused input or are finishing, then we have buffered a full group
+            if (pendingInput != null || finishing) {
+                updateMemoryUsage();
+                return WorkProcessor.ProcessorState.ofResult(
+                        WorkProcessor.create(
+                                new SingletonPagesIndex(finishPagesIndex())), !finishing);
+            }
+
+            updateMemoryUsage();
+            return needsMoreData();
+        }
+
+        private void updateMemoryUsage()
+        {
+            long bytes = 0;
+            if (pagesIndex != null) {
+                bytes += pagesIndex.calculateEstimatedSize();
+            }
+
+            if (pendingInput != null) {
+                bytes += pendingInput.getRetainedSizeInBytes();
+            }
+
+            memoryContext.setBytes(bytes);
+        }
+    }
+
+    private static class SingletonPagesIndex
+            implements WorkProcessor.Process<PagesIndex>
+    {
+        private PagesIndex pagesIndex;
+
+        private SingletonPagesIndex(PagesIndex pagesIndex)
+        {
+            this.pagesIndex = pagesIndex;
+        }
+
+        @Override
+        public WorkProcessor.ProcessorState<PagesIndex> process()
+        {
+            if (pagesIndex == null) {
+                return finished();
+            }
+
+            PagesIndex result = pagesIndex;
+            pagesIndex = null;
+            return WorkProcessor.ProcessorState.ofResult(result);
+        }
+    }
+
+    private class ProduceWindowResultsPerPartition
+            implements WorkProcessor.Transformation<WindowPartition, WorkProcessor<Page>>
+    {
+        private final LocalMemoryContext memoryContext;
+
+        private ProduceWindowResultsPerPartition(AggregatedMemoryContext memoryContext)
+        {
+            this.memoryContext = memoryContext.newLocalMemoryContext(ProduceWindowResultsPerPartition.class.getSimpleName());
+        }
+
+        @Override
+        public WorkProcessor.ProcessorState<WorkProcessor<Page>> process(Optional<WindowPartition> windowPartitionOptional)
+        {
+            if (state == State.FINISHING ||
+                    !windowPartitionOptional.isPresent()) {
+                state = State.FINISHED;
+
+                // Output the remaining page if we have anything buffered
+                if (!pageBuilder.isEmpty()) {
+                    Page page = pageBuilder.build();
+                    pageBuilder.reset();
+                    return WorkProcessor.ProcessorState.ofResult(
+                            WorkProcessor.create(
+                                    new SingletonPage(page)));
+                }
+            }
+
+            windowPartitionOptional.get().processNextRow(pageBuilder);
+
+            if (!pageBuilder.isFull()) {
+                state = State.NEEDS_INPUT;
+                return needsMoreData();
+            }
+
+            updateMemoryUsage();
+
+            return WorkProcessor.ProcessorState.ofResult(
+                    WorkProcessor.create(
+                            new SingletonPage(pageBuilder.build())));
+        }
+
+        private void updateMemoryUsage()
+        {
+            long bytes = 0;
+            if (pagesIndex != null) {
+                bytes += pagesIndex.calculateEstimatedSize();
+            }
+
+            if (pendingInput != null) {
+                bytes += pendingInput.getRetainedSizeInBytes();
+            }
+
+            memoryContext.setBytes(bytes);
+        }
+    }
+
+    private static class SingletonPage
+            implements WorkProcessor.Process<Page>
+    {
+        private Page page;
+
+        private SingletonPage(Page page)
+        {
+            this.page = page;
+        }
+
+        @Override
+        public WorkProcessor.ProcessorState<Page> process()
+        {
+            if (page == null) {
+                return finished();
+            }
+
+            Page result = page;
+            page = null;
+            return WorkProcessor.ProcessorState.ofResult(result);
+        }
     }
 }
